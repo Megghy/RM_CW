@@ -100,7 +100,9 @@ public class RacerAgent : Agent
             }
             else if(stoppedTime / Time.fixedDeltaTime > timeToRestart) // 原地停止过长
             {
-                Debug.Log($"原地停留过久");
+                Debug.Log($"原地停留过久, 重新开始");
+                EndEpisode();
+                stoppedTime = 0;
             }
         }
     }
@@ -134,10 +136,6 @@ public class RacerAgent : Agent
         {
             Debug.Log("所有 WheelCollider 已分配。", this);
         }
-
-        // 移除对车辆控制器和反射字段的检查
-        // if (carController == null) { ... }
-        // if (targetSteerAngleField == null) { ... }
 
         Debug.Log("赛车Agent初始化完成。", this);
     }
