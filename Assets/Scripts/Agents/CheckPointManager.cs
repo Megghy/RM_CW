@@ -31,20 +31,7 @@ public class CheckpointManager : MonoBehaviour
     private void FindAndSortCheckpoints()
     {
         // 查找所有带有 "Checkpoint" Tag 的 GameObjects
-        GameObject[] checkpointObjects = GameObject.FindGameObjectsWithTag("Checkpoint");
-
-        if (checkpointObjects.Length == 0)
-        {
-            Debug.LogError("No GameObjects found with the tag 'Checkpoint'. Checkpoint system will not work.", this);
-            return;
-        }
-
-        // 转换成 Transform 列表
-        List<Transform> unsortedCheckpoints = new List<Transform>();
-        foreach (GameObject go in checkpointObjects)
-        {
-            unsortedCheckpoints.Add(go.transform);
-        }
+        var unsortedCheckpoints = GameObject.FindGameObjectsWithTag("Checkpoint").Select(c => c.transform).ToList();
 
         // 按名称中的索引排序 (例如 "CheckPoint_0", "CheckPoint_1", ...)
         try

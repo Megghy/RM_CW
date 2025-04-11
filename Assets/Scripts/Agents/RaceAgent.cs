@@ -8,15 +8,17 @@ using UnityEngine;
 [RequireComponent(typeof(Rigidbody))]
 public class RacerAgent : Agent
 {
+    private int agentId;
+    private static int totalAgents = 0;
     [Header("Debug & Manual Control")]
-    [Tooltip("勾选此项以启用键盘手动控制，用于测试车辆移动。禁用 ML-Agents 控制。")]
-    public bool enableManualControl = false; // 新增：手动控制开关
+    [Tooltip("启用键盘手动控制")]
+    public bool enableManualControl = false;
 
     [Header("Sensors")]
     public Transform sensorOrigin; // 传感器射线起点，通常位于车辆前部
     public float maxRayDistance = 50f; // 射线最大探测距离
-    public LayerMask rayLayerMask = 1; // 射线碰撞层设置（默认为Default层，建议在Inspector中设置为障碍物层）
-    public int rayDirections = 5; // 射线方向数量：1=仅前方，3=前/左/右，5=前/左前/右前/左/右
+    public LayerMask rayLayerMask = 1; // 射线碰撞层设置
+    public int rayDirections = 5; // 射线探测方向数量
     public float rayAngleSpread = 90f; // 射线探测扇形角度范围（例如90度表示左右各45度）
 
     [Header("Wheel Control")]
@@ -25,8 +27,8 @@ public class RacerAgent : Agent
     public WheelCollider rearLeftWheel;
     public WheelCollider rearRightWheel;
     public float maxSteerAngle = 30f;    // 最大转向角度
-    public float motorForce = 1500f;   // 电机驱动力
-    public float brakeForce = 3000f;   // 刹车力
+    public float motorForce = 500f;   // 电机驱动力
+    public float brakeForce = 1000f;   // 刹车力
 
     private HashSet<int> triggeredCheckpoints = new HashSet<int>();
 
@@ -43,9 +45,29 @@ public class RacerAgent : Agent
 
     [Header("Rewards")]
     [Tooltip("给予速度奖励所需的最小速度 (m/s)")]
-    public float minSpeedForReward = 0.1f;
+    public float minSpeedForReward = 0.5f;
     [Tooltip("在原地停止多久时触发重新开始 (s)")]
     public float timeToRestart = 3f;
+    [Tooltip("到达目标检查点时给予的奖励")]
+    public float checkpointReward = 1f;
+    [Tooltip("朝向目标检查点移动时给予的奖励的系数")]
+    public float towardsCheckpointRewardAmount = 0.001f; // 控制朝向奖励的大小
+    [Tooltip("当车辆非常靠近人行道（但仍在路上）时施加的每步惩罚值, 应为负数")]
+    public float sidewalkProximityPenalty = -0.002f;
+    [Tooltip("击中护栏时施加的惩罚值")]
+    public float guardHitPenalty = -0.5f;
+
+    [Header("Road Detection")]
+    [Tooltip("定义道路标签")]
+    public string roadTag = "Road";
+    [Tooltip("定义人行道标签")]
+    public string sidewalkTag = "Sidewalk";
+    [Tooltip("离开道路时施加的惩罚值")]
+    public float offRoadPenalty = -1.0f;
+    [Tooltip("检测左右两侧人行道的向下射线的水平偏移距离")]
+    public float sidewalkCheckOffsetWidth = 0.8f; // 根据车辆宽度调整
+    [Tooltip("检测左右两侧人行道的向下射线的最大检测距离")]
+    public float sidewalkCheckDistance = 1.5f;
 
     // 内部状态
     private Rigidbody rb;
@@ -53,79 +75,23 @@ public class RacerAgent : Agent
     private float currentSteerAction = 0f;
     private float currentThrottleBrakeAction = 0f;
 
-    private const float maxSpeed = 20f;
+    private const float maxSpeed = 10f;
 
     private int stoppedTime = 0;
-
-
-    // 物理相关逻辑更新，用于持续性奖励/惩罚 (此部分未修改)
-    void FixedUpdate()
-    {
-        // 如果启用了手动控制，则覆盖 ML-Agents 的行为
-        if (enableManualControl)
-        {
-            HandleManualInput();
-        }
-        else // 否则执行 ML-Agents 的常规奖励逻辑
-        {
-            // 1. 时间惩罚
-            float timePenalty;
-            if (MaxStep > 0) // 如果设置了有限的最大步数
-            {
-                // 使用原始的按比例缩放的惩罚
-                timePenalty = baseTimePenaltyFactor / MaxStep;
-            }
-            else // 如果 MaxStep = 0 (无限步数)
-            {
-                // 使用固定的、小的负奖励作为时间惩罚
-                timePenalty = fixedTimePenalty;
-                // 注意：确保 fixedTimePenalty 是一个负值
-                if (fixedTimePenalty > 0)
-                {
-                    Debug.LogWarning("fixedTimePenalty 应为负值以作为惩罚", this);
-                    fixedTimePenalty = -Mathf.Abs(fixedTimePenalty); // 强制为负
-                }
-            }
-            AddReward(timePenalty);
-
-            // 2. 速度奖励
-            float speed = rb.linearVelocity.magnitude;
-            if (speed >= minSpeedForReward) // 只有在超过最小速度时才给予奖励
-            {
-                float speedReward = (speed / maxSpeed) * 0.005f;
-                AddReward(speedReward);
-                cumulativeReward += speedReward;
-
-                stoppedTime = 0;
-            }
-            else if(stoppedTime / Time.fixedDeltaTime > timeToRestart) // 原地停止过长
-            {
-                Debug.Log($"原地停留过久, 重新开始");
-                EndEpisode();
-                stoppedTime = 0;
-            }
-        }
-    }
 
     // 初始化函数，在游戏开始或Agent启用时调用
     public override void Initialize()
     {
+        agentId = totalAgents++;
         rb = GetComponent<Rigidbody>();
         if (rb == null)
         {
             Debug.LogError("Rigidbody组件缺失！", this);
         }
-
+        checkpointManager = CheckpointManager.Instance;
         // 检查检查点管理器
-        if (checkpointManager == null)
-        {
-            Debug.LogError("检查点管理器引用缺失，请在Inspector中设置！", this);
-        }
-        else
-        {
-            checkpointManager.RegisterAgent(this);
-            Debug.Log($"Agent已注册至检查点管理器：{checkpointManager.name}", this);
-        }
+        checkpointManager.RegisterAgent(this);
+
 
         // 检查 WheelCollider 引用
         if (frontLeftWheel == null || frontRightWheel == null || rearLeftWheel == null || rearRightWheel == null)
@@ -134,22 +100,121 @@ public class RacerAgent : Agent
         }
         else
         {
-            Debug.Log("所有 WheelCollider 已分配。", this);
+            Debug.Log("所有 WheelCollider 已分配", this);
         }
 
-        Debug.Log("赛车Agent初始化完成。", this);
+        Debug.Log($"赛车Agent {agentId} 初始化完成, Decision Id: {GetComponent<DecisionRequester>().GetInstanceID()}", this);
     }
-    private void HandleManualInput()
-    {
-        float h = Input.GetAxis("Horizontal"); // A/D 或左右箭头
-        float v = Input.GetAxis("Vertical");   // W/S 或上下箭头
 
-        // 直接调用核心控制逻辑
-        ApplyWheelControl(h, v);
+
+    // 物理相关逻辑更新，用于持续性奖励/惩罚
+    void FixedUpdate()
+    {
+        // 如果启用了手动控制，则覆盖 ML-Agents 的行为
+        if (enableManualControl)
+        {
+            HandleManualInput();
+        }
+        else // 否则执行 ML-Agents 的常规奖励/惩罚逻辑
+        {
+
+            // 时间惩罚
+            float timePenalty;
+            if (MaxStep > 0)
+            {
+                timePenalty = baseTimePenaltyFactor / MaxStep;
+            }
+            else
+            {
+                timePenalty = fixedTimePenalty;
+                if (fixedTimePenalty > 0)
+                {
+                    Debug.LogWarning("fixedTimePenalty 应为负值以作为惩罚", this);
+                    fixedTimePenalty = -Mathf.Abs(fixedTimePenalty);
+                }
+            }
+            AddReward(timePenalty);
+            // 人行道检测
+            Vector3 verticalOffset = Vector3.up * 0.1f;
+            Vector3 rightOffset = transform.right * sidewalkCheckOffsetWidth;
+
+            // 使用辅助方法检查两侧
+            var (isCloseToSidewalkLeft, isOnRoadLeft) = CheckSidewalkAndOnRoad(transform.position + verticalOffset - rightOffset);
+            var (isCloseToSidewalkRight, isOnRoadRight) = CheckSidewalkAndOnRoad(transform.position + verticalOffset + rightOffset);
+
+
+            if (!isOnRoadLeft && !isOnRoadRight)
+            {
+                Debug.Log($"车辆已脱离道路 ({transform.position})！回合结束，惩罚 {offRoadPenalty}");
+                AddReward(offRoadPenalty);
+                cumulativeReward += offRoadPenalty;
+                EndEpisode();
+                return; // 脱离道路，立即结束当前 FixedUpdate 帧的处理
+            }
+
+            // 如果左侧或右侧紧邻人行道 (但车辆本身仍在路上)，则施加惩罚
+            if (isCloseToSidewalkLeft || isCloseToSidewalkRight)
+            {
+                AddReward(sidewalkProximityPenalty);
+                cumulativeReward += sidewalkProximityPenalty;
+            }
+
+            // 速度奖励 & 原地停止检测 & 朝向检查点奖励
+            float speed = rb.linearVelocity.magnitude;
+            if (speed >= minSpeedForReward) // 只有在超过最小速度时才进行后续奖励和检测
+            {
+                // 速度奖励
+                float speedReward = (speed / maxSpeed) * 0.005f;
+                AddReward(speedReward);
+                cumulativeReward += speedReward;
+
+                // 朝向检查点奖励
+                Transform targetCheckpoint = checkpointManager?.GetAgentTargetCheckpoint(this);
+                if (targetCheckpoint != null)
+                {
+                    // 计算从车辆指向目标检查点的方向向量, 抬高0.5f
+                    Vector3 directionToTarget = ((targetCheckpoint.position + Vector3.up * 0.5f) - transform.position).normalized;
+                    // 获取车辆当前速度方向（归一化）
+                    Vector3 velocityDirection = rb.linearVelocity.normalized;
+
+                    // 计算两个方向的点积（结果范围 -1 到 1）
+                    float dotProduct = Vector3.Dot(velocityDirection, directionToTarget);
+
+                    // 只在朝向目标时给予奖励 (dotProduct > 0)
+                    // 使用 Mathf.Max(0f, dotProduct) 将负值截断为0
+                    float towardsReward = Mathf.Max(0f, dotProduct) * towardsCheckpointRewardAmount;
+                    AddReward(towardsReward);
+                    cumulativeReward += towardsReward; // 更新累计奖励记录
+                }
+
+                stoppedTime = 0; // 正在移动，重置停止计时器
+            }
+            else // 速度低于 minSpeedForReward，检查是否停止过久
+            {
+                stoppedTime++; // 增加停止的物理帧数计数
+                // 使用 Time.fixedDeltaTime 将帧数转换为秒数进行比较
+                if ((stoppedTime * Time.fixedDeltaTime) > timeToRestart)
+                {
+                    Debug.Log($"原地停留过久 ({stoppedTime * Time.fixedDeltaTime:F1}s > {timeToRestart}s), 重新开始");
+                    AddReward(-5f);
+                    EndEpisode();
+                    stoppedTime = 0; // 重置计数器
+                }
+            }
+
+            if (GetCumulativeReward() < -20f)
+            {
+                Debug.Log("超过惩罚限制");
+                AddReward(-5f);
+                EndEpisode();
+            }
+        }
     }
+
     // 收集环境观察数据
     public override void CollectObservations(VectorSensor sensor)
     {
+        sensor.AddObservation(agentId / totalAgents); // 添加 Agent ID 作为观察数据
         // 1. 射线观察
         for (int i = 0; i < rayDirections; i++)
         {
@@ -181,19 +246,97 @@ public class RacerAgent : Agent
         sensor.AddObservation(normalizedAngularVelocity);
 
         // 3. 目标检查点信息
-        if (checkpointManager != null && checkpointManager.GetAgentTargetCheckpoint(this) is { } targetCheckpoint)
+        if (checkpointManager.GetAgentTargetCheckpoint(this) is { } targetCheckpoint)
         {
-            Vector3 dirToTargetWorld = (targetCheckpoint.position - transform.position).normalized;
+            // 抬高0.5m以免陷入地面
+            var targetPos = targetCheckpoint.position + Vector3.up * 0.5f;
+            Vector3 vectorToTargetWorld = targetPos - transform.position;
+            float distanceToTarget = vectorToTargetWorld.magnitude;
+            Vector3 dirToTargetWorld = vectorToTargetWorld.normalized; // 目标检查点方向
             Vector3 dirToTargetLocal = transform.InverseTransformDirection(dirToTargetWorld);
+
+            // 射线连接目标点和自身位置
+            Debug.DrawLine(transform.position, targetPos, Color.blue, 0.01f);
+
             sensor.AddObservation(dirToTargetLocal.x);
             sensor.AddObservation(dirToTargetLocal.z);
+            float maxExpectedDistance = 50f; // 正则化最大距离
+            sensor.AddObservation(Mathf.Clamp01(distanceToTarget / maxExpectedDistance));
         }
         else
         {
             sensor.AddObservation(0f);
             sensor.AddObservation(0f);
+            sensor.AddObservation(0f);
         }
-        // 总观察值数量 = rayDirections + 1(速度) + 1(角速度) + 1(俯仰角) + 2(目标方向) = rayDirections + 5
+
+        // 4. 自身姿态信息 (Pitch & Roll)
+        // Pitch (绕X轴旋转)
+        float pitch = (transform.eulerAngles.x > 180f) ? transform.eulerAngles.x - 360f : transform.eulerAngles.x;
+        sensor.AddObservation(pitch / 180f); // 归一化到 [-1, 1]
+
+        // Roll (绕Z轴旋转)
+        float roll = (transform.eulerAngles.z > 180f) ? transform.eulerAngles.z - 360f : transform.eulerAngles.z;
+        sensor.AddObservation(roll / 180f); // 归一化到 [-1, 1]
+
+        // 5. 垂直速度
+        float verticalVelocity = rb.linearVelocity.y;
+        // 需要根据赛道和车辆能力设定一个合理的归一化范围
+        float maxVerticalSpeed = 10f;
+        sensor.AddObservation(Mathf.Clamp(verticalVelocity / maxVerticalSpeed, -1f, 1f));
+
+        // 6. 前方地面坡度
+        float groundSlope = 0f;
+        float slopeRayLength = 2f; // 向下探测的距离
+        if (Physics.Raycast(sensorOrigin.position, Vector3.down, out RaycastHit slopeHit, slopeRayLength, rayLayerMask))
+        {
+            // 计算地面法线与世界垂直方向(Vector3.up)的夹角
+            float angle = Vector3.Angle(slopeHit.normal, Vector3.up);
+            // 可以根据上坡/下坡给一个符号，例如通过法线的y分量判断
+            float slopeSign = Mathf.Sign(Vector3.Dot(slopeHit.normal, transform.forward) * -1); // 粗略判断前后坡度
+            groundSlope = Mathf.Clamp(angle / 45f, 0f, 1f) * slopeSign;
+            Debug.DrawRay(sensorOrigin.position, Vector3.down * slopeHit.distance, Color.blue);
+        }
+        else
+        {
+            Debug.DrawRay(sensorOrigin.position, Vector3.down * slopeRayLength, Color.cyan);
+        }
+        sensor.AddObservation(groundSlope);
+
+        // 7. 左右侧地面类型检测 (是否为人行道)
+        // 计算左右两侧射线的起始点 (略微抬高，并向左右偏移)
+        Vector3 verticalOffset = Vector3.up * 0.1f;
+        Vector3 rightOffset = transform.right * sidewalkCheckOffsetWidth;
+        Vector3 leftRayOrigin = transform.position + verticalOffset - rightOffset;
+        Vector3 rightRayOrigin = transform.position + verticalOffset + rightOffset;
+
+        // 绘制左右侧射线
+        Debug.DrawRay(leftRayOrigin, Vector3.down * sidewalkCheckDistance, Color.green);
+        Debug.DrawRay(rightRayOrigin, Vector3.down * sidewalkCheckDistance, Color.green);
+
+        var (isSidewalkLeft, _) = CheckSidewalkAndOnRoad(leftRayOrigin);
+        var (isSidewalkRight, _) = CheckSidewalkAndOnRoad(rightRayOrigin);
+
+        // 添加观察值 (1.0 表示是人行道, 0.0 表示不是)
+        sensor.AddObservation(isSidewalkLeft ? 1.0f : 0.0f);
+        sensor.AddObservation(isSidewalkRight ? 1.0f : 0.0f);
+    }
+    private (bool isSidewalk, bool isOnRoad) CheckSidewalkAndOnRoad(Vector3 rayOrigin)
+    {
+        if (Physics.Raycast(rayOrigin, Vector3.down, out RaycastHit hit, sidewalkCheckDistance))
+        {
+            return (hit.transform.CompareTag(sidewalkTag), hit.transform.CompareTag(roadTag));
+        }
+        return (false, false);
+    }
+
+    private void HandleManualInput()
+    {
+        float h = Input.GetAxis("Horizontal"); // A/D 或左右箭头
+        float v = Input.GetAxis("Vertical");   // W/S 或上下箭头
+
+        // 直接调用核心控制逻辑
+        ApplyWheelControl(h, v);
     }
 
     // 检查点触发器检测
@@ -210,26 +353,26 @@ public class RacerAgent : Agent
                 return; // 忽略重复触发
             }
 
-            // 记录此检查点已触发
-            triggeredCheckpoints.Add(checkpointInstanceID);
-
             var (correctCheckpoint, lapCompleted) = checkpointManager.AgentPassedCheckpoint(this, other.transform);
 
             if (correctCheckpoint)
             {
-                float reward = 1.0f;
-                Debug.Log($"通过正确检查点（{other.name}）！奖励+{reward}", this);
+                Debug.Log($"通过正确检查点（{other.name}）！奖励+{checkpointReward}", this);
                 if (lapCompleted)
                 {
-                    float lapBonus = 2.0f;
-                    reward += lapBonus;
-                    Debug.Log($"完成一圈！额外奖励+{lapBonus}，此检查点总奖励：{reward}", this);
+                    float lapBonus = 10.0f;
+                    var lapReward = checkpointReward + lapBonus;
+                    cumulativeReward += lapReward;
+                    Debug.Log($"完成一圈！额外奖励+{lapBonus}，此检查点总奖励：{checkpointReward}", this);
 
                     // 完成一圈后清空已触发检查点记录
                     triggeredCheckpoints.Clear();
                 }
-                AddReward(reward);
-                cumulativeReward += reward;
+                AddReward(checkpointReward);
+                cumulativeReward += checkpointReward;
+
+                // 记录此检查点已触发
+                triggeredCheckpoints.Add(checkpointInstanceID);
             }
             else
             {
@@ -244,18 +387,21 @@ public class RacerAgent : Agent
     // 物理碰撞检测
     void OnCollisionEnter(Collision collision)
     {
-        Debug.Log($"检测到碰撞：{collision.gameObject.name}", this);
         if (wallCollisionName.Contains(collision.gameObject.name))
         {
-            float penalty = -1.0f;
-            Debug.Log($"撞击到'{wallCollisionName}'！回合结束，惩罚{penalty}", this);
-            AddReward(penalty);
-            cumulativeReward += penalty;
-            EndEpisode(); // 撞墙终止当前回合
+            Debug.Log($"撞击到'{collision.gameObject.name}'，惩罚{guardHitPenalty}", this);
+            AddReward(guardHitPenalty);
+            cumulativeReward += guardHitPenalty;
+            //EndEpisode(); // 撞墙不重开只扣分
+        }
+        else
+        {
+            Debug.Log($"检测到碰撞：{collision.gameObject.name}", this);
+
         }
     }
 
-    // 接收神经网络的决策动作 (修改此部分以控制 WheelCollider)
+    // 接收神经网络的决策动作
     public override void OnActionReceived(ActionBuffers actions)
     {
         // 如果启用了手动控制，则忽略来自 ML-Agents 的动作
@@ -267,8 +413,8 @@ public class RacerAgent : Agent
         float steerAction = actions.ContinuousActions[0];
         float throttleBrakeAction = actions.ContinuousActions[1];
 
-        currentSteerAction = steerAction;
-        currentThrottleBrakeAction = throttleBrakeAction;
+        steerAction = Mathf.Clamp(steerAction, -1f, 1f);
+        throttleBrakeAction = Mathf.Clamp(throttleBrakeAction, -1f, 1f);
 
         // 调用核心控制逻辑
         ApplyWheelControl(steerAction, throttleBrakeAction);
@@ -277,9 +423,12 @@ public class RacerAgent : Agent
     {
         if (frontLeftWheel == null || frontRightWheel == null || rearLeftWheel == null || rearRightWheel == null)
         {
-            // Debug.LogWarning("WheelColliders 未设置，无法应用控制。");
+            // Debug.LogWarning("WheelColliders 未设置，无法应用控制");
             return; // 如果没有设置车轮，则不执行任何操作
         }
+
+        currentSteerAction = steerInput;
+        currentThrottleBrakeAction = throttleBrakeInput;
 
         // 1. 转向控制 (只应用于前轮)
         float currentSteerAngle = Mathf.Clamp(steerInput, -1f, 1f) * maxSteerAngle;
@@ -295,12 +444,9 @@ public class RacerAgent : Agent
             currentMotorTorque = Mathf.Clamp(throttleBrakeInput, 0f, 1f) * motorForce;
             currentBrakeTorque = 0f; // 加速时不刹车
 
-            // 应用到驱动轮 (RWD)
+            // 应用到后轮
             rearLeftWheel.motorTorque = currentMotorTorque;
             rearRightWheel.motorTorque = currentMotorTorque;
-            // 前轮也清除马达扭矩（如果是RWD）
-            frontLeftWheel.motorTorque = 0f;
-            frontRightWheel.motorTorque = 0f;
 
             // 清除所有轮子刹车力
             frontLeftWheel.brakeTorque = 0f;
@@ -338,42 +484,40 @@ public class RacerAgent : Agent
         // 1. 重置物理状态
         rb.linearVelocity = Vector3.zero;
         rb.angularVelocity = Vector3.zero;
-        Debug.Log("重置刚体速度。", this);
+        Debug.Log("重置刚体速度", this);
 
         // 2. 重置位置和朝向
         if (startPosition != null)
         {
-            transform.SetPositionAndRotation(startPosition.position, startPosition.rotation);
+            // 左右随机偏移
+            //transform.SetPositionAndRotation(startPosition.position, startPosition.rotation);
+            transform.SetPositionAndRotation(new(startPosition.position.x, startPosition.position.y, startPosition.position.z + Random.Range(-2f, 2f)), startPosition.rotation);
             Debug.Log($"Agent已重置到起始位置：{startPosition.name}", this);
         }
         else
         {
             transform.SetPositionAndRotation(new Vector3(0, 0.5f, 0), Quaternion.identity);
-            Debug.LogWarning("未设置起始位置！重置Agent到世界原点。", this);
+            Debug.LogWarning("未设置起始位置！重置Agent到世界原点", this);
         }
 
         // 3. 重置检查点状态
         triggeredCheckpoints.Clear();
         checkpointManager.ResetAgent(this);
-        //Debug.Log("已通知检查点管理器重置Agent状态。", this);
+        //Debug.Log("已通知检查点管理器重置Agent状态", this);
 
         // 4. 重置 WheelCollider 状态 (清除上一轮的力和转向)
-        if (frontLeftWheel != null && frontRightWheel != null && rearLeftWheel != null && rearRightWheel != null)
-        {
-            frontLeftWheel.motorTorque = 0f;
-            frontRightWheel.motorTorque = 0f;
-            rearLeftWheel.motorTorque = 0f;
-            rearRightWheel.motorTorque = 0f;
+        frontLeftWheel.motorTorque = 0f;
+        frontRightWheel.motorTorque = 0f;
+        rearLeftWheel.motorTorque = 0f;
+        rearRightWheel.motorTorque = 0f;
 
-            frontLeftWheel.brakeTorque = 0f;
-            frontRightWheel.brakeTorque = 0f;
-            rearLeftWheel.brakeTorque = 0f;
-            rearRightWheel.brakeTorque = 0f;
+        frontLeftWheel.brakeTorque = 0f;
+        frontRightWheel.brakeTorque = 0f;
+        rearLeftWheel.brakeTorque = 0f;
+        rearRightWheel.brakeTorque = 0f;
 
-            frontLeftWheel.steerAngle = 0f;
-            frontRightWheel.steerAngle = 0f;
-            Debug.Log("已重置 WheelCollider 状态。", this);
-        }
+        frontLeftWheel.steerAngle = 0f;
+        frontRightWheel.steerAngle = 0f;
     }
 
     // 人工控制测试方法
@@ -403,21 +547,40 @@ public class RacerAgent : Agent
             guiBackgroundTexture.Apply();
 
             guiLabelStyle = new GUIStyle(GUI.skin.label);
-            guiLabelStyle.fontSize = 14;
+            guiLabelStyle.fontSize = 12; // Smaller font for above car
             guiLabelStyle.normal.background = guiBackgroundTexture;
             guiLabelStyle.normal.textColor = Color.white;
             guiLabelStyle.padding = new RectOffset(5, 5, 5, 5);
+            guiLabelStyle.alignment = TextAnchor.MiddleCenter; // Center align the text
         }
 
-        Rect displayRect = new(10, 10, 250, 100); // 稍微调大一点高度以适应内边距
+        // Convert the position 2 units above the car to screen space
+        Vector3 worldPosition = transform.position + Vector3.up * 2.0f;
+        Vector3 screenPosition = Camera.main.WorldToScreenPoint(worldPosition);
 
+        // If the car is behind the camera, don't show the UI
+        if (screenPosition.z < 0)
+            return;
+
+        // Calculate display rect at the world-to-screen position
+        float width = 200;
+        float height = 80;
+        Rect displayRect = new Rect(
+            screenPosition.x - (width / 2), // Center horizontally
+            Screen.height - screenPosition.y - (height / 2), // Invert Y (GUI Y is inverted from screen Y)
+            width,
+            height
+        );
+
+        // Prepare the display text
         string controlMode = enableManualControl ? "Manual" : "ML-Agent";
-        string displayText = $"[{CompletedEpisodes}] Control: {controlMode}\n" +
-                             $"Steer Input: {currentSteerAction:F2}\n" +
-                             $"Throttle/Brake Input: {currentThrottleBrakeAction:F2}\n" +
-                             $"Current Reward: {cumulativeReward}\n" +
-                             $"Speed: {rb.linearVelocity.magnitude}";
+        string displayText = $"[{CompletedEpisodes}] {controlMode}\n" +
+                             $"Steer: {currentSteerAction:F2}\n" +
+                             $"Throttle: {currentThrottleBrakeAction:F2}\n" +
+                             $"Reward: {GetCumulativeReward():F1}\n" +
+                             $"Speed: {rb.linearVelocity.magnitude:F1}";
 
+        // Draw the label at the position above the car
         GUI.Label(displayRect, displayText, guiLabelStyle);
     }
 }

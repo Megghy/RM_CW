@@ -4,8 +4,8 @@ behaviors:
     trainer_type: ppo
 
     hyperparameters:
-      batch_size: 1024
-      buffer_size: 10240
+      batch_size: 2048
+      buffer_size: 20480
       learning_rate: 0.0003
       beta: 0.005
       epsilon: 0.2
@@ -23,7 +23,7 @@ behaviors:
         gamma: 0.99
         strength: 1.0
 
-    max_steps: 1000000
+    max_steps: 10000000
     time_horizon: 64
     summary_freq: 10000
 
